@@ -1,992 +1,778 @@
-# Register Banks and AXI4-Lite — Exam-Oriented Lecture Notes
+# Week 4 — Emulation: System-Level Design
+## Detailed exam notes with theory, implementation workflow, diagrams and revision questions
 
-> **Course material:** `02-register-banks.pdf` (Week 2 slides) and `ELFPGA_W2.pdf` (lecture transcript).
-> **Focus:** register-bank design, MMIO programmer's model, UART datasheet interpretation, smart-timer/PWM example, byte strobes, register side-effects, shadow/active configuration, and RTL verification.
->
-> **How to use these notes:** Read Sections 1–7 for concepts, Sections 8–12 for implementation, then revise the timing diagrams, worked examples, and exam questions. The lecture's own Smart Timer register map and terminology are retained. Additional protocol explanations are included where needed to make the implementation understandable.
+**Source basis:** `ELFPGA_W4.pdf` (182-page lecture transcript) and `04-emulation.pdf` (13-slide lecture deck). The notes preserve the lecture's scope and examples. Explanatory additions are marked **Practical interpretation** where useful. The lecture does not provide a conventional AXI/AMBA cycle waveform for this week; therefore the diagrams below are system boot / MMIO interaction sequences, not invented bus timing specifications.
 
 ---
 
-## 1. The big picture: why a register bank exists
+## 1. Learning objectives
 
-A hardware datapath performs the actual work: counting, filtering, packet processing, PWM generation, data conversion, and so on. A CPU needs a controlled way to configure that datapath and observe what it is doing. A **register bank** provides this software-visible interface.
+By the end of this topic, you should be able to:
 
-The CPU accesses the peripheral through **memory-mapped I/O (MMIO)**. Each register is assigned an address (usually an offset from a peripheral base address). A software load reads a register; a software store writes one. The register bank translates those transactions into internal control signals and state.
+1. Distinguish simulation from emulation and explain their abstraction levels.
+2. Explain Renode's role in system-level emulation.
+3. Describe a machine, system bus, CPU, RAM and memory-mapped peripheral.
+4. Load and execute a bare-metal ELF in Renode.
+5. Inspect the address map and register contents using the monitor.
+6. Explain how a stock Linux image is booted on VExpress and Zynq/ZedBoard models.
+7. Describe the kernel + BusyBox + initramfs build workflow.
+8. Explain why a Device Tree Blob (DTB), boot arguments, reset PC and memory addresses matter.
+9. Integrate a custom Linux kernel module with an emulated MMIO peripheral.
+10. Explain physical-to-kernel-virtual MMIO mapping and safe driver cleanup.
 
-### 1.1 Analogy
+---
 
-Think of a washing machine:
+## 2. Simulation versus emulation
 
-- The **datapath** is the motor, pump, drum, and control machinery.
-- The **register bank** is the control panel: wash mode, spin speed, start, stop, status lights.
-- The **CPU/software** is the person selecting settings and checking the display.
-- The **bus interface** is the wiring and communication protocol between the control panel and the machine.
+### 2.1 Simulation
 
-The person does not need to know the motor's internal commutation sequence. Likewise, software should not need to know the internal RTL implementation. It needs a documented set of registers and rules.
+A **simulation** executes a model of system behaviour. The model captures *what* the system should do; it does not necessarily reproduce the exact physical implementation or internal mechanism.
 
-### 1.2 Main design goals
+The lecture's familiar example is Verilog simulation:
 
-1. **A small, discoverable API:** a documented address map and bit definitions tell firmware how to use the peripheral.
-2. **Decoupling:** software transaction timing should not dictate the datapath's cycle-by-cycle operation.
-3. **Observability/debug:** status flags, counters, and error bits expose internal events to software.
-4. **Predictable side-effects:** reading or writing a register must have explicitly documented consequences.
-5. **Extensibility:** reserved address space and reserved bits can allow future revisions, but software must not depend on them.
+- A behavioural model may describe logic using `always` blocks and Boolean expressions.
+- A gate-level model may instantiate gates such as AND, OR and NOT.
+- The simulator evaluates signal changes and scheduled events.
+- Simulation time is an internal model of time. The wall-clock time taken by the simulator is not necessarily related to the hardware's real execution time.
 
-### 1.3 Functional description versus programmer's model
+For example, a Verilog testbench may advance simulated time by 10 ns in a fraction of a second, or take much longer than 10 ns to compute it. The simulator's execution speed is not the physical clock frequency.
 
-A datasheet generally has two complementary viewpoints:
+**Important distinction:** We normally say that a C program is *executed*, while a Verilog description is *simulated*. The latter is a model whose behaviour is evaluated.
 
-| Datasheet part | Main question | Typical contents |
+### 2.2 Emulation
+
+**Emulation** recreates the behaviour of a target system at a useful abstraction level so that software intended for that target can run against the model.
+
+Examples of abstraction levels discussed in the lecture:
+
+- **Instruction-set-level emulation:** target processor instructions are interpreted/emulated in software. A binary built for the target CPU can execute.
+- **Gate-level modelling/emulation:** behaviour is represented at individual logic-gate level.
+- **Cycle-accurate emulation:** timing and state progression are modelled cycle by cycle. This matters particularly in hardware/software co-simulation.
+
+The lecture's CPU example is useful: a detailed RTL model may contain flip-flops, adders and gates to update the program counter. A higher-level emulator can represent the architectural effect as `PC = PC + 4` for a simple sequential instruction path. This is faster, but it intentionally abstracts away internal gate activity.
+
+The objective is **functional equivalence** at the chosen abstraction level: software should observe behaviour consistent with the intended target system.
+
+### 2.3 Comparison table
+
+| Aspect | Simulation | System-level emulation |
 |---|---|---|
-| Functional description | What does the hardware do, and what are its limitations? | Features, data path, supported rates, FIFO depth, interfaces, operating conditions |
-| Programmer's model | How does software operate it? | Register summary, offsets, access types, reset values, bit fields, usage sequences, side-effects |
+| Main object | Model of behaviour | Model of a target system |
+| Typical input | RTL / behavioural model | Target binary plus platform model |
+| Abstraction | Behavioural or gate level, depending on model | Often instruction-set and peripheral level |
+| Main observation | Signal/state changes | Program execution and system behaviour |
+| Time | Simulated time may not match wall-clock time | Execution speed is an emulator implementation property |
+| Typical use here | Verify RTL logic | Boot software, Linux and drivers before hardware bring-up |
 
-**Exam point:** The functional description helps decide whether a peripheral is suitable. The programmer's model tells a firmware developer exactly how to configure and use it.
+**Exam nuance:** The words are related and can overlap. A sufficiently detailed RTL simulation can reproduce system behaviour, but in this course *emulation* usually means a higher-level model that makes it practical to run a complete software stack.
+
+### 2.4 Why not boot Linux using a full RTL simulation?
+
+A processor implemented in RTL may require enormous computation to simulate every internal event. Booting a large OS through a gate-level model is often impractically slow.
+
+System-level emulation abstracts processor internals while preserving the architectural behaviour software depends on. It can therefore execute many more target instructions per second and make useful observations about a complete system.
 
 ---
 
-## 2. MMIO address map and register anatomy
+## 3. Renode: purpose and capabilities
 
-### 2.1 Base address plus offset
+The lecture uses **Renode**, an open-source development framework from Antmicro.
 
-A peripheral is assigned a **base address** by the system address map. Individual registers are selected using fixed offsets:
+Its role in this course is to construct a model of a complete embedded system and run software on it before implementing the system in physical hardware.
+
+### 3.1 What can be modelled?
+
+A Renode system can include:
+
+- One or more CPU cores.
+- System RAM and other memory regions.
+- A system bus.
+- Standard peripherals such as UART and SPI.
+- Interrupt controllers and timers.
+- Custom peripherals implemented as software models.
+- RTL components connected through co-simulation (an advanced topic mentioned by the lecture).
+
+Renode supports several processor families. The course examples use ARM processors, including Cortex-A9 / ARMv7-A platforms.
+
+### 3.2 Deterministic execution and debugging
+
+The lecture highlights deterministic execution and debugging:
+
+- The system can be paused and stepped.
+- Individual instructions can be inspected.
+- Peripheral accesses can be logged.
+- The monitor can inspect the address map and memory contents.
+- UART output can be displayed in an analyzer window.
+
+Determinism is valuable because a failing software interaction can be reproduced and inspected without relying on a physical board's timing or availability.
+
+### 3.3 Software emulation versus hardware emulation
+
+The Renode demonstrations are **software-level emulation**: a software model of the CPU and peripherals executes target instructions.
+
+The lecture also mentions hardware emulators such as Synopsys ZeBu and Cadence Palladium. These use FPGA-based hardware platforms to emulate a design represented by RTL. They can provide a much more detailed hardware model, but they are a different class of tool and are not the main focus of this week's Renode exercises.
+
+---
+
+## 4. System model: bus, CPU, memory and peripherals
+
+### 4.1 The system bus
+
+The system bus is the common interconnect through which the CPU accesses memory and memory-mapped peripherals.
+
+The lecture uses Renode's `sysbus` abstraction. In a real design, the interconnect may be AXI or another AMBA bus. For the simple Renode model, the important point is the address map and the connections between components; the monitor-level `sysbus` abstraction is not itself a complete electrical/timing description of AXI.
+
+### 4.2 Components
+
+- **CPU:** fetches and executes instructions. Its program counter (PC) identifies the next instruction address.
+- **RAM:** stores program instructions, data, kernel images and runtime state.
+- **UART:** serial console used to display boot messages and interact with a shell.
+- **MMIO peripheral:** a device whose control/status registers occupy addresses in the processor's memory map.
+- **Interrupt controller:** routes peripheral interrupt requests to the CPU where the platform model includes one.
+
+### 4.3 Memory-mapped I/O (MMIO)
+
+With MMIO, a peripheral's registers are assigned addresses in the same address space used by the CPU for memory accesses.
+
+A CPU store to a peripheral register address is decoded by the interconnect and delivered to the peripheral. A load from that address returns the peripheral register's value.
+
+The lecture's simplified smart timer is initially represented as a memory-mapped block. This is a stub/fake peripheral for demonstrating the software path; it is not yet a cycle-accurate timer implementation.
+
+### 4.4 Example memory map from the simple lecture platform
+
+The simple platform description places:
+
+- System RAM at `0x80000000`, with a size of `0x00400000` (4 MiB).
+- Smart-timer register window at `0x70000000`, with a size of `0x00001000` (4 KiB).
+
+The two regions do not overlap. Addresses outside mapped regions have no device assigned in this simplified model.
+
+![Illustrative memory map](emulation_diagrams/memory_map.png)
+
+**Address-range calculation**
+
+For a region with base \(B\) and size \(S\), the last included byte is:
 
 \[
-\text{Register address} = \text{Peripheral base address} + \text{Register offset}
+A_{\mathrm{last}} = B + S - 1
 \]
 
-For example, if a peripheral is mapped at `0x4000_0000`, and a register has offset `0x08`, its absolute address is `0x4000_0008`.
+For RAM:
 
-The base address is platform-dependent; the offsets are defined by the peripheral's programmer's model. This is why portable driver code often receives the peripheral base address from a platform header/device tree rather than assuming it is universal.
+\[
+0x80000000 + 0x00400000 - 1 = 0x803FFFFF
+\]
 
-### 2.2 Byte addresses and word alignment
+Thus the RAM range is `0x80000000` through `0x803FFFFF`.
 
-A 32-bit register occupies four byte lanes. In a conventional word-aligned map, consecutive 32-bit registers are placed at offsets:
+For the smart timer:
 
-- `0x00`
-- `0x04`
-- `0x08`
-- `0x0C`
+\[
+0x70000000 + 0x1000 - 1 = 0x70000FFF
+\]
 
-The address bus is byte-addressed, even though the register width is 32 bits. Therefore, an address increment of four selects the next 32-bit register.
+Thus its window is `0x70000000` through `0x70000FFF`.
 
-For a 32-bit data bus, the low two address bits select a byte position within a 4-byte word. In the Week 2 Smart Timer design, the word index is decoded with:
-
-```verilog
-wire [1:0] word_sel_w = awaddr_q[3:2];
-wire [1:0] word_sel_r = araddr_q[3:2];
-```
-
-Thus:
-
-| `ADDR[3:2]` | Offset | Register |
-|---:|---:|---|
-| `2'b00` | `0x00` | CTRL |
-| `2'b01` | `0x04` | PERIOD |
-| `2'b10` | `0x08` | DUTY |
-| `2'b11` | `0x0C` | STATUS |
-
-**Important distinction:** Selecting a word with `ADDR[3:2]` does not by itself implement byte writes. Byte-level write qualification is handled by `WSTRB`.
-
-### 2.3 Address aliasing and alignment
-
-If hardware ignores `ADDR[1:0]`, addresses `0x00`, `0x01`, `0x02`, and `0x03` may all select the same 32-bit register. This is called **aliasing**.
-
-The lecture recommends avoiding accidental confusion by enforcing/documenting word-level access. A robust peripheral should define what it does with misaligned accesses: accept and alias them, ignore them, or return an error. Do not leave the behavior accidental.
-
-### 2.4 What a register definition should document
-
-For every register, document:
-
-- Offset and name.
-- Width (e.g., 32 bits).
-- Access type (RW, RO, WO, W1C, W1P, etc.).
-- Reset value or explicitly unspecified reset state.
-- Bit-field names and meanings.
-- Reserved bits and required read/write behavior.
-- Side-effects of reads and writes.
-- Whether byte strobes are supported.
-- Any sequencing requirement (for example, disable before changing configuration).
-
-### 2.5 Reserved and unused locations
-
-A reserved address or bit is **not spare storage for application software**. The implementation may change in a future revision. A read may return an unspecified value, and a write may have an undocumented effect.
-
-Common safe implementation policy:
-
-- **RAZ:** Read-As-Zero.
-- **WI:** Writes-Ignored.
-- Together, **RAZ/WI** means reserved bits read as zero and writes to them do not alter state.
-
-Even when a particular datasheet says RAZ/WI, software should still avoid using reserved fields. Do not rely on reserved behavior unless the specification explicitly guarantees it.
+**Practical interpretation:** If the driver is configured with the wrong base address, it accesses a different region. The Linux module may load successfully but will not communicate with the intended peripheral.
 
 ---
 
-## 3. Register access semantics and side-effects
+## 5. Renode file types and monitor workflow
 
-The letters in a register summary are not merely labels. They define the software contract.
+### 5.1 `.repl` platform description
 
-| Type / pattern | Meaning | Typical use |
-|---|---|---|
-| RW | Read and write | Configuration such as period, divider, mode |
-| RO | Read only | Status, counters, identification |
-| WO | Write only | Command/data push register |
-| W1C | Write 1 to clear | Sticky interrupt/error/event flags |
-| W1S | Write 1 to set | Set bits without read-modify-write |
-| W1T | Write 1 to toggle | Toggle control bits |
-| W0C / W0S | Write 0 to clear / set | Less common; must be explicitly documented |
-| RC | Read to clear | Event/status registers where a read acknowledges an event |
-| W1P | Write 1 to pulse | Start, reset, trigger, kick-watchdog command |
-| Sticky-until-reset | Once set, remains set until specified clear/reset | Fault/event capture |
-| Lock / write-once | Configuration becomes immutable after a write or lock event | Secure/boot configuration |
-| SET/CLR aliases | Separate addresses set or clear selected bits | Avoid read-modify-write races |
-| Shadowed register | Software writes a staging value; hardware applies it later | Glitch-free updates at a safe boundary |
+The lecture refers to platform-description files with the `.repl` extension. They describe the hardware model: CPU, memory, peripherals, bus mappings, interrupt connections and other platform components.
 
-### 3.1 RW, RO, and WO
+Think of `.repl` as the *hardware inventory and wiring description*.
 
-- **RW:** A write updates the stored value; a later read normally returns that value.
-- **RO:** Software can observe the state but cannot directly modify it. The hardware changes it.
-- **WO:** Software can write a command or data item, but readback may be undefined or may expose a different meaning. A UART transmit data register is a common conceptual example: writing pushes a byte into the transmit path.
+### 5.2 `.resc` Renode script
 
-A single address can have different read and write meanings. The UART data register discussed in the lecture is an example: writes supply transmit data, while reads return received data (and, in FIFO mode, associated receive status bits).
+A `.resc` script automates the sequence of monitor commands needed to create and configure a machine.
 
-### 3.2 W1C: write-one-to-clear
+Typical responsibilities include:
 
-A W1C flag is cleared by writing a one to its bit position. Writing zero leaves it unchanged.
+1. Create a machine.
+2. Load a platform description.
+3. Load program or kernel images.
+4. Set CPU state and boot arguments.
+5. Open a UART analyzer.
+6. Start execution.
 
-Example: `STATUS.WRAP` is sticky.
+Think of `.resc` as the *bring-up procedure* for a platform.
 
-| Value written to bit 0 | Result |
-|---:|---|
-| 0 | Do not clear the flag |
-| 1 | Clear the flag |
+### 5.3 Important commands shown in the lecture
 
-Why W1C is useful:
+| Command / construct | Purpose |
+|---|---|
+| `mach create` | Create a machine instance |
+| `machine LoadPlatformDescription @file.repl` | Load the platform model |
+| `include @file.resc` / `i @file.resc` | Execute/include a Renode script |
+| `sysbus WhatIsAt <address>` | Identify the component mapped at an address |
+| `sysbus ReadDoubleWord <address>` | Read a 32-bit word from the bus address |
+| `sysbus WriteDoubleWord <address> <value>` | Write a 32-bit word (use only when appropriate) |
+| `start` | Start/resume emulated execution |
+| `pause` | Pause execution |
+| `showAnalyzer uartX` | Open a UART output analyzer |
+| `LoadELF <file>` | Load an ELF image using its ELF load information |
 
-- Hardware can set a flag when an event occurs.
-- Software can clear only the event(s) it has handled.
-- Software does not need to read a register, modify a bit, and write the whole value back.
-- This reduces read-modify-write races, especially when hardware can set flags asynchronously to software's sequence.
+The exact command sequence depends on the platform and script. Use the course's supplied scripts as the authoritative syntax for the installed Renode version.
 
-**RTL sketch:**
+### 5.4 Bare-metal execution: what happens?
 
-```verilog
-if (write_status && wstrb_q[0] && wdata_q[0])
-    status_wrap <= 1'b0;
+In a bare-metal system, there is no operating system to load the application, create processes or provide `printf()`.
 
-if (wrap_pulse)
-    status_wrap <= 1'b1;
-```
+The basic path is:
 
-If both clear and set happen in the same clock cycle, the assignment priority determines the result. In the sketch above, the later assignment has priority in a single procedural block. A production design must consciously specify event-versus-clear priority; do not leave it to accidental statement ordering.
+1. Compile C source for the target CPU.
+2. Link it into an ELF executable with suitable load addresses and entry point.
+3. Create the Renode machine and load its platform description.
+4. Load the ELF into the emulated memory.
+5. Ensure the CPU starts at the correct entry point / reset state.
+6. Start the machine.
+7. Inspect UART output, logs, memory or peripheral register values.
 
-### 3.3 W1P: write-one-to-pulse
+The ELF contains metadata such as loadable segments and entry-point information. Renode can use this to place the program in the appropriate memory locations.
 
-A W1P bit is a command, not a stored state bit. Writing one generates a one-clock-cycle pulse. Reading the bit returns zero.
+### 5.5 Why does bare-metal code use addresses directly?
 
-```verilog
-// Default every cycle
-ctrl_rst_pulse <= 1'b0;
+Without an OS, there is no driver framework or standard I/O service. A simple program may use a pointer to a known MMIO address and read/write registers directly.
 
-// Reassert only on a qualifying write
-if (write_ctrl && wstrb_q[0])
-    ctrl_rst_pulse <= wdata_q[1];
-```
-
-Use W1P for actions such as soft reset, start capture, or kick watchdog. Do not use it for a condition that must remain asserted. For a sustained reset, use a normal state bit or a dedicated reset protocol.
-
-### 3.4 Read-to-clear (RC) versus W1C
-
-With RC, the act of reading clears the event. This can be dangerous when multiple software contexts, interrupt handlers, or diagnostic tools may read the same register: one reader can clear information before another reader observes it.
-
-W1C is often preferable for shared status because software explicitly acknowledges the bits it has handled. RC can still be appropriate when the peripheral specification requires it and the ownership/reading rules are clear.
-
-### 3.5 Set/clear aliases and read-modify-write hazards
-
-Suppose a control register contains independent bits. Software performs:
+Conceptual example:
 
 ```c
-REG |= (1u << 3);   // read, modify, write
+#define TIMER_BASE   0x70000000u
+#define REG_CONTROL  (*(volatile unsigned int *)(TIMER_BASE + 0x00u))
+#define REG_PERIOD   (*(volatile unsigned int *)(TIMER_BASE + 0x04u))
+#define REG_DUTY     (*(volatile unsigned int *)(TIMER_BASE + 0x08u))
+
+int main(void)
+{
+    REG_CONTROL = 1u;
+    REG_PERIOD  = 100u;
+    REG_DUTY    = 25u;
+    REG_CONTROL = 2u;
+
+    for (;;) {
+        /* Keep the bare-metal program alive. */
+    }
+}
 ```
 
-If hardware changes another bit between the read and write, the stale value may overwrite that change. Dedicated `REG_SET` and `REG_CLR` addresses avoid this class of race by applying a bit mask directly.
+This is an illustrative C pattern, not a complete portable driver. The actual register offsets and semantics must match the peripheral specification. `volatile` tells the compiler that accesses are observable and must not be optimized away as ordinary unused memory operations; it does not by itself provide synchronization or make a multi-step hardware protocol atomic.
 
 ---
 
-## 4. Byte enables: AXI4-Lite WSTRB
+## 6. Bus inspection and register debugging
 
-A 32-bit write-data bus contains four byte lanes. `WSTRB[3:0]` tells the slave which lanes contain valid write bytes.
+A major learning objective is **peek/poke**: inspect or modify the emulated system's bus-visible state.
 
-| `WSTRB` | Byte lane 3 | Byte lane 2 | Byte lane 1 | Byte lane 0 |
-|---|---|---|---|---|
-| `4'b0001` | Keep | Keep | Keep | Write |
-| `4'b0010` | Keep | Keep | Write | Keep |
-| `4'b0100` | Keep | Write | Keep | Keep |
-| `4'b1000` | Write | Keep | Keep | Keep |
-| `4'b1111` | Write | Write | Write | Write |
-| `4'b0000` | Keep | Keep | Keep | Keep |
+### 6.1 `WhatIsAt`
 
-For a 32-bit register, byte lane `i` maps to bits `[8*i +: 8]`.
+Use `sysbus WhatIsAt <address>` to determine which component owns an address.
 
-```verilog
-integer i;
-for (i = 0; i < DATA_WIDTH/8; i = i + 1) begin
-    if (wstrb_q[i])
-        period_shadow[i*8 +: 8] <= wdata_q[i*8 +: 8];
-end
+This answers: *Is this address RAM, UART, the smart timer, or unmapped space?*
+
+### 6.2 `ReadDoubleWord`
+
+Use `sysbus ReadDoubleWord <address>` to inspect a 32-bit value.
+
+Example from the lecture deck:
+
+```text
+sysbus WhatIsAt 0x70000000
+sysbus ReadDoubleWord 0x70000004
 ```
 
-### 4.1 Worked example
+If the peripheral register initially contains zero, the monitor reports zero. After a valid write, reading the same register should show the updated value if the model implements that storage behaviour.
 
-Assume:
+### 6.3 Debugging sequence
 
-- Current `PERIOD = 32'h1122_3344`
-- `WDATA = 32'hAABB_CCDD`
-- `WSTRB = 4'b0101`
+1. Confirm the peripheral is mapped at the expected base.
+2. Read the register before writing.
+3. Write a known test value.
+4. Read it back.
+5. Compare the result with what the software interface reports.
+6. If the values differ, check address, offset, access width, mapping and driver configuration.
 
-The enabled lanes are lane 0 and lane 2:
+**Common mistake:** confusing the base address with the register offset. For example, a register at offset `0x04` is accessed at `BASE + 0x04`, not at `0x04`.
 
-- Lane 0 replaces bits `[7:0]`: `44 → DD`
-- Lane 2 replaces bits `[23:16]`: `22 → BB`
-- Lanes 1 and 3 are preserved.
+---
 
-Result:
+## 7. Booting a stock Linux system
+
+The lecture demonstrates two example platforms.
+
+### 7.1 VExpress
+
+The stock VExpress example uses a pre-existing Renode script:
+
+```text
+i @scripts/single-node/vexpress.resc
+```
+
+The script downloads or locates a kernel and root filesystem, loads them into the appropriate memory locations, configures the CPU and starts execution.
+
+The lecture describes this as a very basic Linux boot. It may show warnings or missing functionality (for example, no modules); the purpose is to demonstrate the overall boot path rather than provide a fully featured board image.
+
+### 7.2 Zynq / ZedBoard
+
+The Zynq example is more representative of a board with a richer peripheral set. The lecture associates it with the ZedBoard / Zynq-7000 family.
+
+The script uses a platform description and loads:
+
+- Linux kernel image (ELF in the described workflow).
+- Root filesystem / initramfs.
+- Device Tree Blob (DTB).
+
+The DTB describes hardware to Linux, including devices and their resources. The kernel uses it to discover or configure platform devices. The lecture explicitly says DTB details are developed further in later material; here, understand its role in describing the board.
+
+The platform model includes items such as CPU, RAM, UARTs, timers, I²C, SPI, SD-card-related devices, Ethernet and an interrupt controller. The actual set depends on the platform description.
+
+### 7.3 Why platform details matter
+
+A kernel image is not automatically compatible with every emulated machine. The platform model and boot configuration must agree on:
+
+- CPU architecture and supported instruction set.
+- RAM base address and size.
+- Peripheral addresses and interrupt connections.
+- UART used as the console.
+- Kernel load address and entry point / reset PC.
+- Initramfs location and size.
+- DTB location and content.
+- Any required address redirects.
+
+A mismatch can cause early boot failure, no console output, memory corruption or a kernel that starts but cannot find required devices.
+
+### 7.4 Boot flow diagram
+
+![Linux boot flow](emulation_diagrams/linux_boot_flow.png)
+
+### 7.5 UART console
+
+The kernel emits early boot messages through a configured console, commonly a serial UART. Renode's UART analyzer lets you observe this output.
+
+The lecture notes that the Zynq example can show output on more than one UART during parts of boot. The final interactive console may be associated with a particular UART (the lecture's demonstration uses UART1 for the login shell). Do not assume that UART0 is always the Linux console; check the kernel command line, DTB and platform mapping.
+
+---
+
+## 8. Building a custom ARM Linux kernel
+
+The second half of the lecture moves from stock images to building a kernel and a minimal user space.
+
+### 8.1 Cross-compilation
+
+The build host may be x86-64, while the target system is ARM. A cross-compiler generates ARM code on the host.
+
+The slide lists packages including:
+
+```bash
+sudo apt-get install \
+  gcc-arm-linux-gnueabihf \
+  g++-arm-linux-gnueabihf \
+  bc bison flex libssl-dev make dwarves cpio
+```
+
+For bare-metal examples, the slide separately lists:
+
+```bash
+sudo apt install gcc-arm-none-eabi
+```
+
+These toolchains serve different targets:
+
+- `arm-none-eabi`: typically bare-metal ARM firmware, without a Linux userspace ABI.
+- `arm-linux-gnueabihf`: ARM Linux binaries using the hard-float GNU/Linux ABI.
+
+Do not interchange them blindly.
+
+### 8.2 Kernel source and configuration
+
+The slide uses Linux kernel version `6.6.110` as its example and points to kernel.org. It also references BusyBox `1.32.1`.
+
+The broad workflow is:
+
+1. Download and extract the Linux kernel source.
+2. Select a suitable baseline configuration.
+3. Configure the kernel for the target platform.
+4. Build the kernel with the ARM cross-compiler.
+5. Build BusyBox for the target architecture.
+6. Construct an initramfs containing BusyBox and required files.
+7. Boot the kernel with the correct command line and initramfs.
+
+The slide's summary specifically calls out `multi_v7_defconfig` as the starting configuration for the ARMv7 class of system used in the demo.
+
+**Configuration matters:** a kernel may compile successfully but still fail to boot if it lacks support for the target CPU, memory layout, console, interrupt controller, filesystem or required drivers.
+
+### 8.3 Example source preparation commands
+
+The lecture slide gives the following example downloads:
+
+```bash
+# Kernel archive (example version used in the lecture)
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.110.tar.xz
+tar -xf linux-6.6.110.tar.xz
+
+# BusyBox archive (example version used in the lecture)
+wget https://www.busybox.net/downloads/busybox-1.32.1.tar.bz2
+tar -xf busybox-1.32.1.tar.bz2
+```
+
+The course-provided `.config` files are to be copied into the corresponding extracted source directories and renamed to `.config` as required. The exact configuration files and helper scripts are part of the course demo material, not embedded in the two PDFs supplied here.
+
+### 8.4 Kernel build concepts
+
+A simplified example of the configuration/build sequence is:
+
+```bash
+export ARCH=arm
+export CROSS_COMPILE=arm-linux-gnueabihf-
+
+make multi_v7_defconfig
+# Apply the course/platform-specific configuration.
+make -j"$(nproc)" zImage
+make -j"$(nproc)" modules
+```
+
+This is a general illustration of the build variables and target. The lecture's exact demo may use additional configuration changes and targets. In particular, do not assume that `zImage`, `vmlinux` and an ELF file are interchangeable formats:
+
+- **`vmlinux`:** uncompressed ELF kernel image, useful for symbols/debugging and, in some workflows, direct loading.
+- **`zImage`:** compressed ARM kernel image with a boot wrapper.
+- **`Image`:** uncompressed kernel image in architectures/workflows that use it.
+
+Use the image format expected by the Renode script and target boot method.
+
+### 8.5 BusyBox
+
+BusyBox provides compact implementations of many common Unix utilities in one executable. It is useful for a small embedded Linux user space.
+
+In this lecture's workflow, BusyBox is compiled for the target ARM system and placed in the initial RAM filesystem. It supplies the shell and basic commands used after the kernel starts user space.
+
+### 8.6 initramfs / initial RAM filesystem
+
+An **initramfs** is an archive of files that the kernel unpacks into a root filesystem in memory during early boot.
+
+Typical contents include:
+
+- `/init` — the first user-space program launched by the kernel.
+- BusyBox.
+- Required applets / symlinks.
+- Device nodes or setup scripts as required.
+- Custom kernel module files (`.ko`) for the later demonstration.
+
+A conceptual minimal `/init` script might mount essential virtual filesystems and then launch a shell. The lecture's actual demo files are provided separately in the course repository; their exact contents are not present in the supplied PDFs.
+
+### 8.7 initramfs versus root filesystem
+
+The terms are related but not identical:
+
+- A **root filesystem** is the directory tree that user space sees as `/`.
+- An **initramfs** is a mechanism for supplying an initial filesystem archive to the kernel.
+- A **RAM disk** traditionally presents a block-device-like disk backed by RAM; the lecture uses this analogy to explain why a filesystem image can be loaded into memory.
+
+The VExpress example refers to a rootfs image loaded at a memory address. The custom kernel demonstration instead prepares a small initramfs with BusyBox and `/init`.
+
+### 8.8 Kernel boot arguments and DTB
+
+Boot arguments communicate important information to the kernel, such as:
+
+- Console device (for example, a serial console).
+- Root filesystem location/type.
+- Initramfs location and size, where applicable.
+- Other platform-specific parameters.
+
+The DTB supplies a structured description of the hardware. The kernel command line and DTB must agree with the emulated platform. If the console argument names the wrong UART, the kernel may be booting but appear silent.
+
+### 8.9 Build-to-boot workflow
+
+![Linux boot sequence](emulation_diagrams/linux_boot_flow.png)
+
+---
+
+## 9. Integrating a custom Linux kernel module
+
+The lecture reuses the smart-timer register interface from the earlier MMIO/register demonstration and connects it to the emulated system.
+
+### 9.1 What is a kernel module?
+
+A Linux kernel module is code that can be loaded into a running kernel, commonly used for device drivers and other kernel extensions.
+
+A loadable module is built against the kernel build tree/configuration it is intended to run with. The module's architecture, kernel version/configuration and exported symbol expectations must be compatible.
+
+The lecture builds a module against the custom kernel tree and places the resulting module in the initramfs. It is then loaded from the Linux shell using `insmod`.
+
+### 9.2 Physical base address parameter
+
+The demonstration module accepts a physical base address:
+
+- If the base is zero, the lecture's module uses its virtual-register behaviour and does not map a physical backend.
+- If a physical base is supplied, the module attempts to reserve and map the peripheral register window.
+
+The lecture's smart-timer base address is `0x70000000`.
+
+This parameter is critical. Supplying zero or an incorrect address means the module is not accessing the intended emulated peripheral, even if the module itself loads.
+
+### 9.3 Correct MMIO access pattern
+
+The lecture describes the following kernel-side sequence:
+
+1. Request ownership of the physical I/O memory range.
+2. Map the physical register window into kernel virtual address space.
+3. Access registers through the mapped pointer using I/O accessors.
+4. On module unload, unmap the region and release the reserved range.
+
+Typical Linux APIs include:
+
+```c
+request_mem_region(phys_base, window_size, "smart-timer");
+ioremap(phys_base, window_size);
+
+/* Register access */
+readl(mmio_base + REG_PERIOD);
+writel(value, mmio_base + REG_PERIOD);
+
+/* Cleanup */
+iounmap(mmio_base);
+release_mem_region(phys_base, window_size);
+```
+
+This is a conceptual API sequence. Production drivers must check every return value, handle errors and follow the exact API contract for the kernel version.
+
+### 9.4 Physical address versus virtual address
+
+The physical base address identifies the device's location in the platform's physical address map. `ioremap()` creates a kernel virtual mapping that the driver can safely use for MMIO accesses.
+
+Therefore:
 
 \[
-\text{PERIOD}_{new} = \texttt{32'h11BB\_33DD}
+\text{physical MMIO address} \ne \text{kernel virtual pointer}
 \]
 
-### 4.2 Short fields inside 32-bit registers
+Do not dereference the raw physical address as an ordinary C pointer in a Linux driver. Use the kernel's I/O mapping and access mechanisms.
 
-In the Smart Timer, CTRL uses only byte 0:
+### 9.5 `readl()` and `writel()`
 
-- `WSTRB[0]` must be one for CTRL bits 0 and 1 to be acted upon.
-- `WSTRB[1]`, `[2]`, and `[3]` should not accidentally change unrelated state.
-- Reserved CTRL bits should be RAZ/WI.
+- `readl(addr)` reads a 32-bit value from an I/O-mapped register.
+- `writel(value, addr)` writes a 32-bit value to an I/O-mapped register.
 
-**Exam point:** `WSTRB` is a byte mask, not a bit mask. Each strobe controls one 8-bit lane.
+These are kernel-provided accessors designed for MMIO. They are not interchangeable with ordinary `*ptr` memory operations.
 
----
+### 9.6 Register interface
 
-## 5. AXI4-Lite transaction mechanics needed for the register bank
+The lecture's smart timer exposes parameters such as:
 
-AXI4-Lite is a lightweight memory-mapped, single-beat interface. It uses independent channels for write address, write data, write response, read address, and read data. The Week 2 lecture builds on the earlier AXI handshake material and uses the stored handshakes to update the register bank.
+- Control.
+- Period.
+- Duty cycle / offset.
+- Status.
 
-### 5.1 VALID/READY handshake rule
+The bare-metal demo writes control, period and duty-related values. The Linux module exposes an interface (including a sysfs attribute in the demonstration) so that user space can change a value such as the period.
 
-For any AXI channel, a transfer occurs on a rising clock edge when:
+The precise bit definitions and complete register semantics are not fully specified in the supplied lecture deck; use the actual peripheral/module source when implementing against hardware.
 
-\[
-\boxed{\text{Handshake} = VALID \land READY}
-\]
+### 9.7 Driver initialization and error unwinding
 
-- The **source** asserts `VALID` when its information is available.
-- The **destination** asserts `READY` when it can accept that information.
-- The source must keep `VALID` and the associated payload stable until the handshake.
-- A transfer does not occur merely because VALID is high or READY is high; both must be high at the sampling edge.
-
-This mechanism allows either side to introduce wait cycles without losing data.
-
-### 5.2 Write channels
-
-| Channel | Signals | Purpose |
-|---|---|---|
-| AW | `AWVALID`, `AWREADY`, `AWADDR` | Write address |
-| W | `WVALID`, `WREADY`, `WDATA`, `WSTRB` | Write data and byte enables |
-| B | `BVALID`, `BREADY`, `BRESP` | Write response |
-
-The address and data channels are **independent**. The address may handshake before the data, or the data may handshake before the address. The slave must remember each accepted item until it has both pieces and can perform the write.
-
-A simplified register-bank implementation may use:
-
-- `aw_hs_done`: an address handshake has occurred and the address is stored.
-- `w_hs_done`: a data handshake has occurred and data/strobes are stored.
-- `do_write`: both pieces are available and no previous B response is blocking a new write.
-
-The slide's expression is:
-
-```verilog
-wire do_write = aw_hs_done && w_hs_done && ~saxi_bvalid;
-```
-
-This is a design-specific internal condition, not an AXI signal. It says the register update is performed only after both write address and write data have been captured, while avoiding a new write during an outstanding response in this simple implementation.
-
-### 5.3 Write timing diagram
-
-![AXI-Lite write timing](images/axi_write_timing.png)
-
-**How to read it:**
-
-1. AWVALID and WVALID are allowed to rise at different times.
-2. AW is accepted at the edge where AWVALID and AWREADY are both high.
-3. W is accepted at the edge where WVALID and WREADY are both high.
-4. Once the slave has both address and data, it updates the selected register.
-5. The slave asserts BVALID with BRESP. The response is consumed when BVALID and BREADY are both high.
-
-The drawing intentionally shows address acceptance before data acceptance. A correct design must also handle the reverse ordering.
-
-### 5.4 Read channels
-
-| Channel | Signals | Purpose |
-|---|---|---|
-| AR | `ARVALID`, `ARREADY`, `ARADDR` | Read address |
-| R | `RVALID`, `RREADY`, `RDATA`, `RRESP` | Read data and response |
-
-The slave accepts the address when `ARVALID && ARREADY`. It then selects the register value, presents it on RDATA, and asserts RVALID. The master accepts the read result when `RVALID && RREADY`.
-
-![AXI-Lite read timing](images/axi_read_timing.png)
-
-### 5.5 Responses and error behavior
-
-AXI response encodings commonly include:
-
-- `OKAY`: successful access.
-- `SLVERR`: slave detected an error.
-- `DECERR`: address decode error (often generated by an interconnect/default slave).
-
-The Week 2 slide checklist explicitly says to respond consistently with OKAY/SLVERR. The exact policy for unmapped addresses, misalignment, and unsupported accesses must be defined by the peripheral/system design.
-
-### 5.6 AXI-Lite implementation checklist
-
-- Capture address and data independently.
-- Do not assume AW and W arrive in the same cycle.
-- Hold response VALID until the response handshake.
-- Keep payload stable while VALID is high and READY is low.
-- Apply WSTRB to every writable byte.
-- Do not perform a register write twice while waiting for BREADY.
-- Ensure read data remains stable while RVALID is high and RREADY is low.
-- Define behavior for unsupported addresses and access types.
-
----
-
-## 6. Case study: ARM PrimeCell UART programmer's model
-
-The lecture uses an ARM UART to demonstrate how to read a real peripheral datasheet. The point is not to memorize every UART register; it is to learn how to interpret the programmer's model.
-
-### 6.1 UART hardware blocks
-
-A UART may contain:
-
-- Transmit and receive logic.
-- Baud-rate generator.
-- Transmit and receive FIFOs.
-- FIFO control and interrupt generation.
-- APB/register-bus interface.
-- DMA request/interface signals.
-- Reset and clock interfaces.
-
-The actual external serial interface may be only TX and RX, but the CPU-facing control interface is much larger. The lecture emphasizes that control/management signals can outnumber the functional I/O pins.
-
-### 6.2 FIFO intuition
-
-A FIFO is a first-in, first-out queue:
-
-- Software can enqueue multiple bytes.
-- Hardware transmits them serially in the background.
-- Software need not wait for every individual bit/byte to finish.
-- Receive hardware can queue incoming bytes until software or DMA reads them.
-
-FIFO status bits tell software whether the queue is empty, full, or has data available. They prevent writes into a full transmit FIFO and reads from an empty receive FIFO.
-
-### 6.3 Register summary: how to interpret columns
-
-A typical register summary contains:
-
-- Offset
-- Register name
-- Access type
-- Reset value
-- Width
-- Brief description
-
-The summary is a navigation aid. The detailed per-register description defines bit meanings and side-effects.
-
-### 6.4 UART data register example
-
-The lecture describes the UART data register as having different read and write behavior:
-
-- A write supplies transmit data, typically in the low eight bits.
-- A read returns received data.
-- When receive FIFOs are enabled, the read value may include the 8-bit data plus four receive error/status bits (break, framing, parity, overrun).
-- Reserved upper bits must not be used.
-
-The lecture's key lesson: **one address can be read/write but have different semantic meanings in each direction.**
-
-### 6.5 Flag/status register example
-
-A UART flag register can expose:
-
-- TX FIFO empty.
-- TX FIFO full.
-- RX FIFO empty.
-- RX FIFO full.
-- Busy.
-- Modem/handshake status such as CTS, DSR, DCD, RI (depending on the UART).
+A driver must undo earlier successful operations if a later initialization step fails.
 
 For example:
 
-- TX FIFO empty generally indicates that more transmit data can be queued.
-- TX FIFO full means software should not enqueue another byte.
-- RX FIFO empty means there is no received byte waiting.
-- RX FIFO full indicates no more receive data can be accepted without draining the FIFO.
-- Busy indicates that transmission or another UART operation is in progress.
+- If memory-region reservation fails, return an error.
+- If reservation succeeds but mapping fails, release the reserved region.
+- If mapping succeeds but device registration fails, unmap and release.
+- If all setup succeeds, retain the resources until module exit.
+- During exit, unregister the interface, unmap MMIO and release the region.
 
-The exact bit positions and reset values must be taken from the specific UART revision's TRM.
+![Kernel module lifecycle](emulation_diagrams/kernel_module_lifecycle.png)
 
-### 6.6 Reset values are meaningful
+This is a fundamental driver-writing rule: **cleanup is the reverse of successful setup**.
 
-A FIFO-empty flag may reset to one because the FIFO is empty after reset. A FIFO-full flag should normally reset to zero. Therefore, not every register bit must reset to zero.
+### 9.8 Demonstration: proving that Linux reaches the peripheral
 
-If a datasheet marks a reset value as unspecified/don't-care, software must not assume it is zero. Read the field description and mask reserved/unused bits before using a register value.
+The lecture demonstrates a cross-check between Linux and the Renode monitor:
 
-### 6.7 Practical firmware pattern (illustrative)
+1. Boot the custom Linux kernel.
+2. Confirm the module is not loaded initially.
+3. Use `insmod` to load the module with the intended physical base address.
+4. Access the module's sysfs attribute (the lecture uses a period attribute).
+5. Write a value such as hexadecimal `0x64` (decimal 100).
+6. Inspect the smart-timer address from the Renode monitor.
+7. Confirm the same value is visible at the corresponding emulated register.
 
-```c
-#define UART_BASE       (/* platform-defined base address */)
-#define UART_DR         (*(volatile unsigned int *)(UART_BASE + 0x00))
-#define UART_FR         (*(volatile unsigned int *)(UART_BASE + 0x18))
+This is an important system-level test: a write made through a Linux interface is reflected in the bus-visible state of the emulated peripheral.
 
-#define UART_FR_TXFE    (1u << 7)
-#define UART_FR_RXFE    (1u << 4)
+### 9.9 Out-of-tree module warning
 
-void uart_putc(unsigned char ch)
-{
-    while ((UART_FR & UART_FR_TXFE) == 0u) {
-        /* Wait until the transmit FIFO is empty.
-           Some drivers instead wait for TX FIFO not-full. */
-    }
-    UART_DR = ch;
-}
-```
+The lecture observes a kernel message indicating an “out of tree” module. This means the module was built separately from the main kernel source tree rather than built into that kernel image.
 
-This is an explanatory pattern, not a complete PL011 driver. In a production driver, waiting for FIFO-not-full is generally more efficient than waiting for FIFO-empty when multiple bytes can be queued. Always follow the specific UART's TRM.
+It is a status/warning worth understanding; it does not by itself prove that the module is faulty. Kernel configuration, module signing and version compatibility can impose additional restrictions in other environments.
 
 ---
 
-## 7. Smart Timer: understand the datapath first
+## 10. MMIO interaction sequence (conceptual timing/sequence diagram)
 
-The Smart Timer is a PWM peripheral. Its core is independent of the bus interface; the AXI-Lite wrapper makes its parameters software-programmable.
+The supplied Week 4 material does not define AXI channel timing or cycle-level register timing. The following image instead shows the *causal sequence* of a Linux-side register write and the corresponding bus-visible state. It is not a substitute for an AXI waveform.
 
-The slide's core interface is:
+![MMIO interaction sequence](emulation_diagrams/mmio_interaction_sequence.png)
 
-```verilog
-module pwm_core (
-    input  wire        clk,
-    input  wire        rstn,
-    input  wire        en,
-    input  wire [31:0] period,
-    input  wire [31:0] duty,
-    output reg         pwm_out,
-    output reg         wrap
-);
-```
+### Step-by-step interpretation
 
-### 7.1 PWM operation
+1. A user-space write reaches a driver interface (for example, a sysfs attribute).
+2. The kernel driver validates/converts the value.
+3. The driver writes to the mapped MMIO register using an I/O accessor.
+4. The bus address is decoded to the smart-timer peripheral.
+5. The peripheral model updates its register state.
+6. The Renode monitor can inspect the same mapped address and observe the updated value.
+7. A later read through the Linux interface can observe the register state, assuming the driver exposes a corresponding read operation.
 
-The core:
-
-1. Counts upward while enabled.
-2. Compares the current count against `duty`.
-3. Drives PWM high while `count < duty`.
-4. Produces a wrap indication when the counter reaches its terminal count and restarts from zero.
-
-A simplified conceptual implementation is:
-
-```verilog
-always @(posedge clk or negedge rstn) begin
-    if (!rstn) begin
-        count   <= 0;
-        pwm_out <= 0;
-        wrap    <= 0;
-    end else begin
-        wrap    <= 0;                 // default: one-cycle pulse
-        if (!en) begin
-            count   <= 0;
-            pwm_out <= 0;
-        end else begin
-            pwm_out <= (count < duty);
-            if (count >= period) begin
-                count <= 0;
-                wrap  <= 1;
-            end else begin
-                count <= count + 1;
-            end
-        end
-    end
-end
-```
-
-This is a teaching sketch consistent with the slide's stated behavior; exact edge ordering and whether the terminal count is `period` or `period-1` must be checked against the actual RTL. That distinction changes the period by one clock.
-
-### 7.2 PWM equations
-
-If the counter visits values 0 through `P` inclusive, then:
-
-\[
-N = P+1 \quad \text{clock cycles per PWM period}
-\]
-
-\[
-f_{\mathrm{PWM}} = \frac{f_{\mathrm{clk}}}{P+1}
-\]
-
-For a conventional compare rule `count < D`, with `D` values in the range 0 through `P+1`:
-
-\[
-D_{\mathrm{fraction}} \approx \frac{D}{P+1},
-\qquad
-\text{Duty percentage} \approx 100\frac{D}{P+1}\%
-\]
-
-These equations assume the counter includes zero and the terminal count, and that the output is high for exactly `D` counter states. Confirm the RTL's terminal-count convention before calculating exact frequency or duty.
-
-### 7.3 Illustrative timing diagram
-
-![PWM counter and output](images/pwm_counter_timing.png)
-
-The example uses a terminal count of 4 and duty threshold 3. The output is high for counter values 0, 1, and 2, and low for 3 and 4. The counter wraps after the terminal count.
-
-### 7.4 Edge cases to reason about
-
-- `duty = 0`: `count < duty` is never true, so output remains low.
-- `duty` greater than the counter's maximum/period: output may remain high for the entire cycle.
-- `period = 0`: depending on RTL, the counter may wrap every clock.
-- `en = 0`: the lecture's conceptual core uses enable to stop/reset the counter; check exact RTL.
-- Changing period or duty in the middle of a count can create a shortened/extended cycle unless updates are staged.
+**Exam point:** Renode monitor access and Linux driver access are two different observation/control paths into the same emulated platform model. Agreement between them is evidence that the MMIO address mapping and software path are connected correctly.
 
 ---
 
-## 8. Smart Timer V1 register map
+## 11. Common failure modes and debugging checklist
 
-The register map is the software API for the PWM datapath.
-
-| Offset | Register | Access | Bits / behavior | Reset |
-|---:|---|---|---|---|
-| `0x00` | CTRL | RW + W1P | bit 0 = EN; bit 1 = RST pulse; other bits RAZ/WI | EN=0; pulse reads 0 |
-| `0x04` | PERIOD | RW | Terminal count; software writes shadow value | `0x000000FF` |
-| `0x08` | DUTY | RW | PWM compare threshold; software writes shadow value | `0x00000000` |
-| `0x0C` | STATUS | RO + W1C | bit 0 = sticky WRAP; bit 1 = UPD_PENDING | flags cleared |
-
-### 8.1 CTRL (`BASE + 0x00`)
-
-- Bit 0 `EN`: persistent state. Write 1 to enable the PWM core; write 0 to disable it.
-- Bit 1 `RST`: W1P command. Writing 1 creates a one-cycle reset pulse; readback is always zero.
-- Other bits: RAZ/WI.
-- The lecture's implementation checks byte lane 0 before interpreting either control bit.
-
-### 8.2 PERIOD (`BASE + 0x04`)
-
-- 32-bit RW configuration register.
-- Reset value: `0x000000FF` (255).
-- Software writes the shadow copy.
-- If the PWM is disabled, the active configuration can be updated immediately.
-- If enabled, the update is marked pending and committed at wrap.
-
-### 8.3 DUTY (`BASE + 0x08`)
-
-- 32-bit RW configuration register.
-- Reset value: `0x00000000`.
-- Defines the compare threshold for `count < duty`.
-- Uses the same shadow/active update policy as PERIOD.
-
-### 8.4 STATUS (`BASE + 0x0C`)
-
-- Bit 0 `WRAP`: sticky status. It is set by a wrap event and remains set until software writes one to clear it.
-- Bit 1 `UPD_PENDING`: indicates that new shadow configuration is waiting for the next safe commit boundary. It is cleared after the active registers are updated.
-- Other bits: reserved/RAZ/WI in this design.
-
-### 8.5 Why shadow values are echoed on read
-
-The readback path returns `period_shadow` and `duty_shadow`, not necessarily the active values. This lets software verify what it most recently programmed, even while the old values remain active until the next wrap.
-
-This is an important distinction:
-
-- **Shadow value:** what software has requested.
-- **Active value:** what the datapath is currently using.
-
-If software needs to inspect the active configuration, the design would need separate active-value readback registers or another documented mechanism.
-
----
-
-## 9. Shadow and active registers: coherent updates
-
-### 9.1 The problem with immediate writes
-
-Suppose the active PWM period is 1000 and the counter is currently at 700. Software writes a new period of 100.
-
-If the active period changes immediately, the current count is already greater than the new terminal count. The core may wrap unexpectedly or produce a truncated pulse. The behavior can be confusing and may violate the requirement that the current PWM cycle finish normally.
-
-### 9.2 Shadow-register solution
-
-Maintain two copies of configuration:
-
-- `period_shadow`, `duty_shadow`: written by software.
-- `period_active`, `duty_active`: consumed by the PWM datapath.
-
-Policy:
-
-1. If disabled, copy shadow values to active values immediately.
-2. If enabled, update the shadow values and set `UPD_PENDING`.
-3. Wait for the natural wrap boundary.
-4. At wrap, copy both shadow values to active values in the same clocked update.
-5. Clear `UPD_PENDING`.
-
-This ensures PERIOD and DUTY change as one coherent configuration at a known boundary.
-
-![Shadow configuration timing](images/shadow_commit_timing.png)
-
-### 9.3 Why this is atomic/coherent
-
-The period and duty settings are related. Updating one without the other can temporarily create an inconsistent PWM configuration. Copying both at the same boundary ensures the next PWM cycle uses a matched pair.
-
-The same technique generalizes to:
-
-- Timer reload values.
-- Clock/rate dividers.
-- Video timing registers applied at vertical blanking (vblank).
-- Motor-control parameters applied at a commutation/PWM boundary.
-- Packet/descriptor configuration applied between transactions.
-
-### 9.4 UPD_PENDING versus WRAP
-
-Do not confuse these two status bits:
-
-- `UPD_PENDING` is a temporary hardware state. It clears automatically when the shadow values are committed.
-- `WRAP` is an event history flag. It is sticky and remains set until software explicitly clears it using W1C.
-
----
-
-## 10. RTL implementation: from bus handshake to datapath control
-
-A clean register-bank implementation can be understood in layers.
-
-### 10.1 Layer 1 — Capture bus payloads
-
-The slave captures the address on the AW handshake and captures data plus strobes on the W handshake. Because the channels are independent, the captured values may arrive on different cycles.
-
-Conceptually:
-
-```verilog
-if (s_axi_awvalid && s_axi_awready) begin
-    awaddr_q   <= s_axi_awaddr;
-    aw_hs_done <= 1'b1;
-end
-
-if (s_axi_wvalid && s_axi_wready) begin
-    wdata_q   <= s_axi_wdata;
-    wstrb_q   <= s_axi_wstrb;
-    w_hs_done <= 1'b1;
-end
-```
-
-This is pseudocode: a complete slave also needs to clear the capture flags at the correct time, generate BVALID, and manage backpressure.
-
-### 10.2 Layer 2 — Decode the register
-
-For this four-register map:
-
-```verilog
-wire [1:0] word_sel_w = awaddr_q[3:2];
-
-case (word_sel_w)
-    2'b00: /* CTRL   */
-    2'b01: /* PERIOD */
-    2'b10: /* DUTY   */
-    2'b11: /* STATUS */
-endcase
-```
-
-The address decode should remain small and combinationally simple. The lecture emphasizes that bus-facing logic should be straightforward and fast.
-
-### 10.3 Layer 3 — Apply write semantics
-
-A register write is not always a simple `reg <= WDATA`:
-
-- CTRL bit 0 is stored state.
-- CTRL bit 1 generates a pulse.
-- PERIOD and DUTY update shadow registers, with byte enables.
-- STATUS bit 0 is W1C.
-- Reserved bits are ignored.
-
-The meaning of each write depends on address, byte strobe, and data bit.
-
-### 10.4 Layer 4 — Update active datapath configuration
-
-The active registers are updated based on enable state and wrap boundary. This is separate from the AXI bus handshake. The CPU can complete a write transaction before the datapath applies the new configuration.
-
-### 10.5 Layer 5 — Readback mux
-
-The read path selects the value associated with the read address:
-
-```verilog
-case (s_axi_araddr[3:2])
-    2'b00: s_axi_rdata <= {30'd0, 1'b0, ctrl_en};
-    2'b01: s_axi_rdata <= period_shadow;
-    2'b10: s_axi_rdata <= duty_shadow;
-    2'b11: s_axi_rdata <= {30'd0, upd_pending, status_wrap};
-endcase
-```
-
-Notice:
-
-- CTRL bit 1 reads as zero because it is a pulse command, not stored state.
-- PERIOD and DUTY read back their shadow values.
-- STATUS returns current status state.
-- Reserved bits read as zero.
-
-### 10.6 Nonblocking assignments and procedural priority
-
-In clocked Verilog, nonblocking assignments (`<=`) schedule register updates for the end of the time step. Multiple `always` blocks execute concurrently; do not assume one block runs before another.
-
-Within one procedural block, if the same register is assigned more than once in the same clock event, the last executed assignment generally determines the scheduled value. This is why default assignments (such as clearing a pulse) are often placed near the start of a clocked block, and a later qualifying condition reasserts the pulse.
-
-**Design discipline:** Make priority explicit for simultaneous conditions such as hardware event set versus software W1C clear. Avoid assigning the same state register from multiple clocked processes.
-
----
-
-## 11. Practical firmware usage sequence
-
-Assume the peripheral base address is supplied by the system. The following sequence illustrates the software-visible contract.
-
-### 11.1 Configure while disabled
-
-1. Disable the peripheral (`CTRL.EN = 0`).
-2. Write PERIOD.
-3. Write DUTY.
-4. Read back PERIOD and DUTY to verify the shadow values.
-5. Clear any stale WRAP status by writing one to STATUS bit 0.
-6. Set `CTRL.EN = 1`.
-
-### 11.2 Update while running
-
-1. Write the new PERIOD value.
-2. Write the new DUTY value.
-3. Read STATUS until `UPD_PENDING` clears.
-4. The new configuration has been committed at a wrap boundary.
-5. If required, clear sticky WRAP using W1C.
-
-### 11.3 C-style pseudocode
-
-```c
-#define REG32(addr) (*(volatile unsigned int *)(addr))
-
-#define TIMER_BASE       (/* assigned by platform */)
-#define TIMER_CTRL       REG32(TIMER_BASE + 0x00)
-#define TIMER_PERIOD     REG32(TIMER_BASE + 0x04)
-#define TIMER_DUTY       REG32(TIMER_BASE + 0x08)
-#define TIMER_STATUS     REG32(TIMER_BASE + 0x0C)
-
-#define CTRL_EN          (1u << 0)
-#define CTRL_RST_W1P     (1u << 1)
-#define STATUS_WRAP      (1u << 0)
-#define STATUS_UPD_PEND  (1u << 1)
-
-void timer_configure(unsigned int period, unsigned int duty)
-{
-    TIMER_CTRL = 0u;                 // disable
-    TIMER_PERIOD = period;
-    TIMER_DUTY = duty;
-    TIMER_STATUS = STATUS_WRAP;     // W1C: clear sticky WRAP
-    TIMER_CTRL = CTRL_EN;            // enable
-}
-
-void timer_request_reset(void)
-{
-    TIMER_CTRL = CTRL_EN | CTRL_RST_W1P; // EN state + one-cycle reset command
-}
-```
-
-**Important:** The example assumes a full-word write to CTRL and the peripheral's defined behavior for EN and RST. In a real driver, ensure byte-lane behavior and concurrent updates are handled correctly. Do not use generic read-modify-write on W1C or command registers unless the register specification explicitly permits it.
-
-### 11.4 Polling pending status
-
-```c
-while ((TIMER_STATUS & STATUS_UPD_PEND) != 0u) {
-    /* Wait for the next wrap boundary and shadow-to-active commit. */
-}
-```
-
-A production driver may prefer an interrupt or timeout rather than an unbounded busy loop.
-
----
-
-## 12. Verification and simulation strategy
-
-The lecture describes walking through `smart_timer_axil.v` and simulating it, then inspecting the waveform in GTKWave. The verification objective is to test both the bus protocol and the peripheral behavior.
-
-### 12.1 Directed tests
-
-| Test | Stimulus | Expected result |
+| Symptom | Likely cause | What to check |
 |---|---|---|
-| Reset | Assert/deassert reset | EN=0, PERIOD shadow reset to `0xFF`, DUTY shadow=0, status cleared |
-| CTRL enable | Write bit 0 = 1 | PWM starts counting |
-| CTRL reset pulse | Write bit 1 = 1 with byte 0 enabled | One-cycle reset pulse; readback bit 1 = 0 |
-| PERIOD write | Write a 32-bit value | Shadow period updates |
-| DUTY write | Write a 32-bit value | Shadow duty updates |
-| Byte strobe | Write selected byte lanes only | Only enabled bytes change |
-| W1C | Set WRAP, write 1 to bit 0 | WRAP clears |
-| W1C with zero | Write 0 to bit 0 | WRAP remains unchanged |
-| Shadow update | Change PERIOD/DUTY while EN=1 | UPD_PENDING sets; active values wait for wrap |
-| Commit | Cause wrap while update pending | Both active values update; pending clears |
-| Readback | Read each offset | Correct value and reserved/pulse bits read as specified |
-| Backpressure | Hold BREADY/RREADY low | Response remains valid and stable until accepted |
-| Channel skew | AW and W arrive on different cycles | Exactly one correct write occurs |
+| ELF does not execute | Wrong entry point, load address or CPU state | ELF entry, platform RAM map, reset PC |
+| `WhatIsAt` shows no device | Peripheral absent or address wrong | `.repl` mapping and base address |
+| Register read is always zero | Wrong offset/base, stub behaviour, or write never reached | Monitor address, driver parameter, register offset |
+| Linux boots but no serial output | Wrong UART console selection or UART not modelled as expected | `console=` argument, DTB, UART mapping |
+| Kernel cannot find root/init | Missing or misplaced initramfs, incorrect boot arguments | Initramfs address/size, `/init`, archive contents |
+| Module fails to load | Kernel/module mismatch, missing symbols, architecture/config issue | Build tree, `vermagic`, target architecture |
+| Module loads but device is not affected | Wrong physical base or mapping failure | `request_mem_region`, `ioremap`, base address |
+| Driver crashes on access | Invalid pointer, wrong register window/offset, bad cleanup | Use I/O accessors, validate mapping and bounds |
+| Init succeeds partially then fails | Resource cleanup incomplete | Unwind successful setup operations in reverse order |
 
-### 12.2 What to inspect in GTKWave
+### Practical debug order
 
-Group related signals so the waveform tells a story:
+1. Verify the platform model first.
+2. Verify the address map with `WhatIsAt`.
+3. Verify the register directly with `ReadDoubleWord`.
+4. Verify the ELF/kernel and boot state.
+5. Verify UART output and boot arguments.
+6. Verify the kernel module's target compatibility.
+7. Verify the physical base and mapping.
+8. Compare Linux-visible values with Renode monitor values.
 
-- Clock/reset.
-- AW channel: AWVALID, AWREADY, AWADDR.
-- W channel: WVALID, WREADY, WDATA, WSTRB.
-- B channel: BVALID, BREADY, BRESP.
-- AR channel: ARVALID, ARREADY, ARADDR.
-- R channel: RVALID, RREADY, RDATA, RRESP.
-- Internal capture flags and decoded write enable.
-- CTRL.EN and CTRL reset pulse.
-- PERIOD/DUTY shadow and active values.
-- Counter, PWM output, wrap pulse.
-- STATUS.WRAP and UPD_PENDING.
-
-Do not inspect only the bus pins. A bus write can be accepted correctly while the internal register update or datapath commit is wrong.
-
-### 12.3 Assertions / properties worth checking
-
-- A handshake occurs only when VALID and READY are simultaneously high at a clock edge.
-- Once VALID is asserted, payload remains stable until handshake.
-- A W1P output is one cycle wide.
-- A W1C bit clears only when the relevant write strobe and data bit are both one.
-- A disabled timer can apply configuration immediately (as specified by this design).
-- An enabled timer applies pending configuration only at wrap.
-- PERIOD and DUTY active values change together at commit.
-- A single accepted write causes exactly one register update.
-- Read data is stable while RVALID=1 and RREADY=0.
+This order isolates hardware-model problems before driver problems.
 
 ---
 
-## 13. Common design mistakes and how to avoid them
+## 12. Exam-focused short answers
 
-1. **Assuming AW and W arrive together.** They are independent channels. Capture each independently.
-2. **Ignoring WSTRB.** Partial writes can corrupt unrelated bytes or command bits.
-3. **Treating a pulse as stored state.** A W1P command should default low and be asserted only for the intended cycle.
-4. **Using read-to-clear for shared flags without considering races.** Prefer W1C where appropriate.
-5. **Changing active PWM parameters mid-cycle.** Use shadow registers and a safe commit boundary.
-6. **Returning shadow values while documenting them as active values.** State exactly what readback represents.
-7. **Forgetting reserved bits.** Define and implement RAZ/WI where appropriate.
-8. **Leaving reset values unspecified accidentally.** Every state element needs a deliberate reset policy.
-9. **Not defining simultaneous event/clear priority.** Specify whether a new hardware event wins over software clear.
-10. **Assuming the terminal count means period+1 in every implementation.** Inspect the actual counter comparison and derive timing from it.
-11. **Testing only nominal transactions.** Include backpressure, split AW/W timing, partial writes, and status races.
-12. **Overcomplicating the address decode.** Keep the register map compact and decode only the necessary address bits.
+### Q1. Define simulation.
 
----
+Simulation evaluates a model of system behaviour. It focuses on the expected functional response and may use behavioural or gate-level representations. Simulator wall-clock speed need not correspond to physical hardware time.
 
-## 14. Exam-focused revision sheet
+### Q2. Define emulation.
 
-### 14.1 Definitions to memorize
+Emulation recreates the behaviour of a target system at a selected abstraction level so that target software, such as a processor binary or operating system, can execute against it. Its goal is functional equivalence at that abstraction.
 
-- **MMIO:** CPU accesses peripheral registers through the system address space.
-- **Register bank:** A set of software-visible registers that configure and observe a hardware block.
-- **Programmer's model:** Register offsets, access permissions, reset values, bit fields, and usage rules.
-- **WSTRB:** Byte-lane write-enable mask.
-- **W1C:** Writing one clears the corresponding status bit.
-- **W1P:** Writing one generates a one-cycle pulse.
-- **Sticky flag:** Remains asserted until explicitly cleared or reset.
-- **Shadow register:** Staging copy written by software; applied to active datapath state at a safe boundary.
-- **VALID/READY handshake:** Transfer occurs at a rising edge where both are high.
-- **RAZ/WI:** Read-as-zero, writes-ignored.
+### Q3. What is instruction-accurate emulation?
 
-### 14.2 Important equations
+It models the architectural effect of each target instruction sufficiently accurately for target binaries to execute. It does not necessarily reproduce every internal gate transition or physical timing detail.
 
-For a 32-bit data bus:
+### Q4. What is Renode?
 
-\[
-\text{Number of byte lanes} = \frac{32}{8}=4
-\]
+Renode is an open-source system-level emulation framework from Antmicro. It models processors, memory, buses and peripherals, supports debugging and can run target software such as bare-metal programs and Linux.
 
-\[
-\text{Register address} = \text{base address}+\text{offset}
-\]
+### Q5. What is the role of `.repl` and `.resc` files?
 
-For a counter visiting 0 through terminal count \(P\):
+A `.repl` file describes the emulated platform hardware. A `.resc` script automates machine creation, platform loading, image loading, CPU setup, analyzer setup and execution.
 
-\[
-N=P+1,\qquad f_{\mathrm{PWM}}=\frac{f_{\mathrm{clk}}}{P+1}
-\]
+### Q6. What is MMIO?
 
-For duty threshold \(D\), assuming `count < D`:
+Memory-mapped I/O assigns peripheral registers addresses in the processor's address space. CPU loads and stores to those addresses access device registers through the system interconnect.
 
-\[
-\text{Duty fraction}\approx \frac{D}{P+1}
-\]
+### Q7. Why is the DTB needed?
 
-### 14.3 Short-answer questions
+The Device Tree Blob describes the hardware platform to Linux, including devices and their resources. It helps the kernel identify and configure the hardware it is running on.
 
-**Q1. Why are register banks used?**  
-They provide a documented MMIO interface through which software configures a datapath, observes status, and debugs hardware without knowing its internal implementation.
+### Q8. What is initramfs?
 
-**Q2. Differentiate functional description and programmer's model.**  
-The functional description explains what the peripheral does and its limitations. The programmer's model explains how software controls it through registers.
+Initramfs is an archive of initial user-space files unpacked by the kernel into a root filesystem in memory. It can contain `/init`, BusyBox, scripts and modules needed during early boot.
 
-**Q3. Why is the peripheral base address not necessarily fixed?**  
-The system address map assigns the base address. The register offsets remain fixed within the peripheral's programmer's model.
+### Q9. Why use BusyBox?
 
-**Q4. What is WSTRB?**  
-A byte-enable vector. Each bit controls whether the corresponding 8-bit lane of WDATA is written.
+BusyBox supplies compact implementations of common Unix utilities in a single executable, making it suitable for a small embedded Linux user space.
 
-**Q5. Explain W1C with an example.**  
-A status bit is cleared by writing one to that bit. Writing zero leaves it unchanged. It allows software to acknowledge selected events without a read-modify-write sequence.
+### Q10. Why must a module be built against the target kernel?
 
-**Q6. Why use W1P for reset?**  
-A reset action may need only a single clock pulse. W1P turns a software write into a one-cycle command and reads back as zero.
+A loadable module depends on the target kernel's architecture, configuration, exported symbols and ABI/version information. A mismatch can prevent loading or cause runtime failures.
 
-**Q7. What is a sticky status bit?**  
-A bit that remains set after the event pulse ends, allowing software to observe the event later. It is cleared by a defined action such as W1C.
+### Q11. Why use `ioremap()`?
 
-**Q8. Why use shadow registers in PWM?**  
-To avoid changing period/duty in the middle of a PWM cycle. The new values are applied together at wrap.
+It maps a physical MMIO range into kernel virtual address space. The driver then accesses registers using the mapped address and kernel I/O accessors.
 
-**Q9. Why must AW and W be handled independently?**  
-AXI4-Lite write address and write data are separate channels and may handshake on different cycles.
+### Q12. Why release resources in reverse order?
 
-**Q10. When does an AXI VALID/READY transfer occur?**  
-At a rising clock edge where VALID and READY are both high.
+If initialization fails after partially acquiring resources, reverse-order cleanup ensures that every successfully acquired resource is released and avoids leaks or conflicting ownership.
 
-### 14.4 Longer design questions
+### Q13. What does the Week 4 demonstration prove?
 
-1. Draw and explain a four-register MMIO map for a PWM peripheral.
-2. Explain the implementation of a W1C sticky status bit, including event/clear priority.
-3. Draw an AXI4-Lite write timing diagram in which AW and W handshakes occur on different cycles.
-4. Explain WSTRB using a 32-bit register and a partial-byte write example.
-5. Explain how shadow and active registers prevent glitches in a PWM generator.
-6. Describe the readback behavior of CTRL, PERIOD, DUTY, and STATUS in the Smart Timer.
-7. Propose a verification plan for the Smart Timer AXI-Lite peripheral.
-8. Explain how a UART's data and flag registers expose FIFO state to software.
+It demonstrates a path from a Linux user-space interface through a kernel module to an MMIO register in a Renode-emulated peripheral, and verifies that the changed register value is visible through the Renode monitor.
 
 ---
 
-## 15. Source alignment and important cautions
+## 13. Likely long-answer questions and answer structure
 
-These notes are based primarily on the two supplied Week 2 materials:
+### A. Explain the complete Renode bare-metal workflow.
 
-- `02-register-banks.pdf`: especially slides 2–7 (design goals and UART programmer's model), 9–17 (PWM core, Smart Timer register map, address decode, WSTRB, W1P, W1C, shadow/active, readback), and 19–22 (register behavior patterns and checklist).
-- `ELFPGA_W2.pdf`: lecture transcript covering the UART datasheet example, address offsets and reserved fields, Smart Timer/PWM behavior, register semantics, RTL implementation, and simulation/waveform inspection.
+Include: target C source → ARM bare-metal cross-compile → ELF → create Renode machine → load `.repl` → load ELF → set/confirm PC → start → inspect UART/registers. Explain why the entry point and RAM map must agree.
 
-**Cautions when applying the notes to a real design:**
+### B. Explain how Renode boots Linux.
 
-- The diagrams in this README are explanatory timing diagrams generated for these notes; they are not screenshots of a measured simulation waveform.
-- The PWM equations depend on the exact terminal-count comparison in the RTL. Confirm whether the counter wraps at `count == period` or another condition.
-- The Smart Timer slide gives a concise behavioral specification. A production implementation must define simultaneous W1C/event priority, misaligned access policy, unsupported-address response, and all reset values precisely.
-- The UART example is used to teach datasheet reading. Exact PL011 bit positions, FIFO modes, and register semantics must be checked against the exact ARM TRM revision used by the target system.
+Include: platform model → CPU/RAM/peripherals → kernel image → initramfs/rootfs → DTB (where required) → boot arguments → PC/register setup → `start` → kernel early boot → console output → `/init` → user-space shell. Discuss compatibility and memory addresses.
+
+### C. Explain custom Linux module integration with MMIO.
+
+Include: build module against kernel tree → include module in initramfs → boot kernel → `insmod` → request physical region → `ioremap` → `readl`/`writel` → expose sysfs/misc interface → verify register through Renode monitor → cleanup on unload. Explicitly distinguish physical and virtual addresses.
+
+### D. Compare simulation, software emulation and hardware emulation.
+
+Compare abstraction, execution speed, timing fidelity, target software execution and typical use. Mention that Renode is software-level system emulation, while FPGA-based hardware emulators execute synthesized RTL on a hardware platform.
 
 ---
 
-## 16. Final mental model
+## 14. Quick revision sheet
 
-A good peripheral has three cleanly separated pieces:
+- Simulation = evaluate a model of behaviour; wall-clock speed is not hardware timing.
+- Emulation = reproduce target-system behaviour at a useful abstraction.
+- Functional equivalence is the objective; accuracy depends on abstraction level.
+- Renode = Antmicro open-source system-level emulation framework.
+- `.repl` = platform/hardware description.
+- `.resc` = automation script.
+- `sysbus` = system-bus view used for mapping and inspection.
+- `WhatIsAt` = identify mapped component.
+- `ReadDoubleWord` = read 32-bit bus value.
+- Bare metal = no OS; application is loaded and starts at a known entry point.
+- ELF contains load/entry metadata.
+- Linux boot requires compatible CPU, memory, peripheral map and boot configuration.
+- DTB describes hardware to Linux.
+- UART analyzer displays serial console output.
+- Cross compiler builds ARM code on a different host architecture.
+- `multi_v7_defconfig` is the lecture's ARMv7 baseline configuration.
+- BusyBox provides compact user-space utilities.
+- initramfs supplies early user space in memory; `/init` starts it.
+- Module must match the target kernel build.
+- `request_mem_region` reserves the physical I/O range.
+- `ioremap` maps physical MMIO into kernel virtual address space.
+- `readl` / `writel` access mapped I/O registers.
+- Cleanup must reverse successful initialization.
+- Correct physical base address is essential.
+- Cross-check Linux register writes against Renode monitor reads.
 
-1. **Datapath:** performs the actual function (the PWM counter and comparator).
-2. **Register bank:** defines the software contract (CTRL, PERIOD, DUTY, STATUS and their side-effects).
-3. **Bus interface:** transports register reads/writes reliably (AXI4-Lite VALID/READY channels).
+---
 
-The register bank turns a hardware datapath into a usable software-controlled peripheral. The quality of the design depends not only on whether the counter works, but also on whether the register semantics, byte enables, status handling, timing boundaries, reset behavior, and bus handshakes are all precise and predictable.
+## 15. Source coverage and boundaries
+
+These notes combine the Week 4 lecture transcript and slide deck:
+
+- **Slides 3–5:** simulation, emulation and Renode.
+- **Slide 6:** toolchain and Renode installation references.
+- **Slide 7:** bare-metal ELF and bus inspection.
+- **Slides 8–9:** stock VExpress and Zynq/ZedBoard Linux boot.
+- **Slides 10–11:** kernel/BusyBox preparation and initramfs workflow.
+- **Slide 12:** custom module integration.
+- **Slide 13:** summary, `multi_v7_defconfig` and Zynq platform-specific considerations.
+- **Lecture transcript, Lectures 1–7:** detailed explanation of platform files, memory mapping, Linux boot, custom kernel preparation and smart-timer MMIO module demonstration.
+
+**Limitations of the supplied source:** the slide deck points to course repository configuration files and demo source code, but those files were not among the uploads. Therefore this guide explains the build and integration process without inventing the missing `.config`, `.repl`, `.resc`, `/init` or module source contents. The timing/sequence diagrams are explanatory illustrations, not source-provided AXI timing waveforms.
